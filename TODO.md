@@ -1,0 +1,17 @@
+## Steps for RogueAP
+- Assign internal vars
+- Check input params
+- Start logging
+- Get authorized APs via
+  - Text file
+  - JSON file
+  - REST API
+- Scan WiFi
+  - Using dump of: sudo iw wlan0 scan
+  - Using internal libs
+- Parse scan results and compare authorized vs unauthorized
+- Communicate non-comformities
+  - via SMTP
+  - via XMPP
+  - via REST API
+- Done
