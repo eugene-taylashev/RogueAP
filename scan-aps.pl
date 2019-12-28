@@ -7,7 +7,8 @@
 #       -h          this help
 #       -l 2        enable debug with level X 0-3 (nothing-high)
 #       -v          be verbose
-#		-i url		URL to JSON with authorized APs
+#		-m normal|strict mode to report unauthorized  
+#		-i url		URL to JSON with authorized/known APs
 #       -o url      URL to report rogue APs
 #       -s file     Text file with dump of `sudo iw wlan0 scan`
 #
@@ -49,16 +50,19 @@ use strict;                 # Good practice
 use warnings;               # Good practice
 
 #==== Global vars ==========
+my $gsScanCmd = 'sudo iw wlan0 scan'; #-- OS command to enumerate WiFi Access Points
+my ($gsInURL, $gsOutURL, $gsScanFile);
+my %gaAuthorized; 		#-- hash for authorized APs BSS->SSID
+my %gaKnown;			#-- hash for known APs BSS->SSID
+my %gaSSID;				#-- hash for SSID in scope SSID->1
+my %gaReport;			#-- hash with report info
+#my @gaUnAuthorized;	#-- list of hashes for unauthorized APs
+
+#-- Logging and tracking vars
 my $gisVerbose = 0;     #-- be Verbose flag. See sub dlog
 my $giLogLevel = 0;     #  Debug level: 0 - no debug errors only, 1 - important only, 2 - also sub in/out, 3 - everything
 my $gisTest = 0;        #-- flag to run self-tests (no useful activity)
 
-my $gsScanCmd = 'sudo iw wlan0 scan';
-my ($gsInURL, $gsOutURL, $gsScanFile);
-my %gaAuthorized; 		#-- hash for authorized APs BSS->SSID
-my @gaUnauthorized;	#-- list of hashes for unauthorized APs
-
-#-- Logging and tracking vars
 my $gsLogFile;        #-- filename for logging/debugging
 my $ghLogFile;        #-- file handler for logging/debugging
 my @gaLogTime;          #-- array to store start time for subs
@@ -76,7 +80,7 @@ my $help;
 
 #--  command line options
 my %args = ("help|h|?" => \$help,   #-- show help and exit
-    "input|i=s" => \$gsInURL,       #-- input REST API URL or file with list of Authorized APs
+    "input|i=s" => \$gsInURL,       #-- input REST API URL or file with list of Authorized/known APs
     "output|o=s" => \$gsOutURL,     #-- reporting REST API URL or file with list of detected unauthorized APs
     "scan|s=s" => \$gsScanFile,     #-- file with WiFi scan results
     "log|l=i" => \$giLogLevel,    #-- set log/debug level
@@ -85,11 +89,17 @@ my %args = ("help|h|?" => \$help,   #-- show help and exit
 
 #==== Constants for this script ==========
  use constant {
-    DIR_LOGS    => 'logs'
+    DIR_LOGS    => 'logs',
+	INI_BLK_AUTH => 'authorized',
+	INI_BLK_KNWN => 'known',
+	RPRT_HIGH	=> 'high',
+	RPRT_MED	=> 'medium',
+	RPRT_LOW	=> 'low',
+	RPRT_INFO	=> 'info'
 };#use constant
 
 #====== Sub prototypes ======
-sub verifyAPs_file();
+sub verifyAPs();
 sub readAPfile($);
 sub countSecs($);
 sub myFtest($$);
@@ -119,6 +129,13 @@ local $SIG{__WARN__} = sub {
 GetOptions (%args) or usage();
 usage() if $help;
 
+#-- prepare the report structure
+$gaReport{RPRT_HIGH} = (); #-- anon list for high severity alarms
+$gaReport{RPRT_MED}  = (); #-- anon list for medium severity alarms
+$gaReport{RPRT_LOW}  = (); #-- anon list for low severity alarms
+$gaReport{RPRT_INFO} = (); #-- anon list for other information
+
+
 #-- Create filename for logs
 $gsLogFile = getFileBase($0).'-'.$curr_date.'.log';
 #-- modify path if DIR_LOGS exists
@@ -127,20 +144,19 @@ $gsLogFile = DIR_LOGS . $gsDirSeparator . $gsLogFile if( -d DIR_LOGS );
 startDebug();       #-- Start debuging
 
 #-- Report settings
-dlog((defined $gsInURL?'':'not ')."ok - Input URL/file with authorised APs=$gsInURL", 1, __LINE__);
-dlog((defined $gsScanFile?'':'not ')."ok - WiFi scan results=$gsScanFile", 1, __LINE__);
-dlog("ok - Log level=$giLogLevel", 1, __LINE__) if $giLogLevel > 0;
-dlog("ok - Log file=$gsLogFile", 1, __LINE__) if $giLogLevel > 0;
-dlog((myFtest('s',$gsScanFile)?'':'not ')."ok - the scan dump file is $gsScanFile", 1, __LINE__);
+dlog((defined $gsInURL?'':'not ')."ok - Input URL/file with authorized APs=$gsInURL", 1, __LINE__);
+dlog("ok - Log level is $giLogLevel", 1, __LINE__) if $giLogLevel > 0;
+dlog("ok - Log file is $gsLogFile", 1, __LINE__) if $giLogLevel > 0;
+dlog((myFtest('s',$gsScanFile)?'':'not ')."ok - WiFi scan results is $gsScanFile", 1, __LINE__) if defined $gsScanFile;
 
 readAPfile($gsInURL) if defined $gsInURL;
-verifyAPs_file();
+verifyAPs();
 
 #-- We are done
 dlog(($giAPprocessed > 0?'':'not ')."ok - Processed $giAPprocessed APs in ".
     countSecs(time()-$gaLogTime[0]), 1);
 
-dlog( "\nok - Done in ". countSecs(time()-$gaLogTime[0]), 1, __LINE__);
+dlog( "ok - Done in ". countSecs(time()-$gaLogTime[0]), 1, __LINE__);
 print "See logs in $gsLogFile\n" if $ghLogFile && $gisVerbose;
 stopDebug(); #-- close the debug file
 exit(0);
@@ -148,123 +164,209 @@ exit(0);
 
 
 #------------------------------------------------------------------------------
-# Process the scan dump file
+# Process the scan results to identify authorized/known/unauthorized APs
 #------------------------------------------------------------------------------
-sub verifyAPs_file(){
-    my $sub_name = 'verifyAPs_file';  dlog("+++++ $sub_name: ", 2, __LINE__ );
+sub verifyAPs(){
+    my $sub_name = 'verifyAPs';  dlog("+++++ $sub_name: ", 2, __LINE__ );
     
-    my $hFile;
-    my $iRecs = 0;  #-- set element counter
-#$gsScanCmd
-    if( ! myFtest('s',$gsScanFile) ){
-        derr( "not ok - the scan dump file $gsScanFile does not exists. ");
-        dlog("----- sub $sub_name -not ok", 2, __LINE__ );
-        return -1;
-    } #if
-    
-    #-- open dump file
-	myFopen( \$hFile, "<:encoding(utf8)", $gsScanFile );
-    if( !$hFile ) {
-        derr("not ok - Could not open the scan dump file $gsScanFile: $!" );
-        dlog("----- sub $sub_name -not ok", 2, __LINE__ );
-        return -1;
-    } else {
-        dlog( "ok - opened the scan dump file $gsScanFile for processing", 1, __LINE__);
-    }#if + else
+    my $sScanRes = '';  #-- APs scan results
 
-	my ($iLines, $iSkiped, $sBSS, $sSSID, $sLastSeen, $iKnown, $iNew, $sDetails) = (0,0,'','','',0,0,'');
+	#-- get scan results from a file or by running OS command
+    if( defined $gsScanFile && myFtest('s',$gsScanFile) ){
+		$sScanRes = readEntireFile($gsScanFile);
+    } else {
+		$sScanRes = `$gsScanCmd 2>&1`;
+	} #if+else
+
+	my ($iLines, $iSkiped, $sBSS, $sSSID, $iAuth, $iKnown, $iNew) 
+	=  (0,0,'','',0,0,0);
+	my $aAPinfo = {};  #-- anon hash
 	my $isBSS = 0;
-	while(my $sLine = <$hFile>) {
+	while($sScanRes =~ /^(.*)$/gm ) {
+		my $sLine = $1;
 		chomp $sLine;
 		++$iLines;
+#$gaReport{RPRT_HIGH}, $gaReport{RPRT_MED},$gaReport{RPRT_LOW},$gaReport{RPRT_INFO}
+#gaKnown gaSSID
+
 		if( 	  $sLine =~ /^BSS\s+(\S+)\(/i ){
 			my $sTmp = $1; 
 
-			#-- close prev BSS
+			#-- close prev BSS block
 			if( $isBSS ){
-				#-- verify if known
-				if(  defined $gaAuthorized{$sBSS} ) {
-					#-- authorised AP
-					dlog( "ok - $sBSS -> $sSSID is authorised", 2, __LINE__ );
+
+					#-- authorized BSS broadcasts protected SSID
+				if(  	isKeyVal( \%gaAuthorized, $sBSS, $sSSID) && 
+						isKeyVal( \%gaSSID, $sSSID, 1 ) ) {
+					dlog( "ok - authorized $sBSS -> protected $sSSID", 2, __LINE__ );
+					$$aAPinfo{'title'} = "Authorized AP ($sBSS) broadcasts protected SSID ($sSSID)";
+					push @{$gaReport{RPRT_INFO}}, $aAPinfo;
+					++$iAuth;
+
+					#-- authorized BSS broadcasts wrong protected SSID
+				} elsif( defined $gaAuthorized{$sBSS} && 
+						 $gaAuthorized{$sBSS} ne $sSSID && 
+						isKeyVal( \%gaSSID, $sSSID, 1 ) ) {
+					dlog( "not ok - authorized $sBSS -> wrong protected $sSSID", 2, __LINE__ );
+					$$aAPinfo{'title'} = "Authorized AP ($sBSS) broadcasts wrong protected SSID ($sSSID)";
+					push @{$gaReport{RPRT_LOW}}, $aAPinfo;
+					++$iAuth;
+
+					#-- authorized BSS broadcasts unknown SSID
+				} elsif( defined $gaAuthorized{$sBSS} && 
+						 ! defined $gaSSID{$sSSID} ) {
+					dlog( "not ok - authorized $sBSS -> unknown $sSSID", 2, __LINE__ );
+					$$aAPinfo{'title'} = "Authorized AP ($sBSS) broadcasts unknown SSID ($sSSID)";
+					push @{$gaReport{RPRT_LOW}}, $aAPinfo;
+					++$iAuth;
+
+					#-- known BSS broadcasts known SSID
+				} elsif( isKeyVal( \%gaKnown, $sBSS, $sSSID) && 
+						 isKeyVal( \%gaSSID, $sSSID, 2 ) ) {
+					dlog( "ok - known $sBSS -> known $sSSID", 2, __LINE__ );
+					$$aAPinfo{'title'} = "Known AP ($sBSS) broadcasts known SSID ($sSSID)";
+					push @{$gaReport{RPRT_INFO}}, $aAPinfo;
 					++$iKnown;
-				} else {
-					#-- unauthorised AP
-					dlog( "not ok - $sBSS -> $sSSID is unauthorised", 1, __LINE__ );
-					my $aAP = {};  #-- anon hash
-					$$aAP{'BSS'} = $sBSS; $$aAP{'SSID'} = $sSSID;
-					$$aAP{'LastSeen'} = $sLastSeen;
-					#$$aAP{'info'} = $sDetails;
-					push @gaUnauthorized, $aAP;
+
+					#-- known BSS broadcasts unknown SSID
+				} elsif( defined $gaKnown{$sBSS} && 
+						 ! defined $gaSSID{$sSSID} ) {
+					dlog( "not ok - known $sBSS -> unknown $sSSID", 2, __LINE__ );
+					$$aAPinfo{'title'} = "Known AP ($sBSS) broadcasts unknown SSID ($sSSID)";
+					push @{$gaReport{RPRT_LOW}}, $aAPinfo;
+					++$iKnown;
+
+					#-- known BSS broadcasts protected SSID
+				} elsif( isKeyVal( \%gaKnown, $sBSS, $sSSID) && 
+						 isKeyVal( \%gaSSID, $sSSID, 1 ) ) {
+					dlog( "not ok - known $sBSS -> protected $sSSID", 1, __LINE__ );
+					$$aAPinfo{'title'} = "Known AP ($sBSS) broadcasts protected SSID ($sSSID)";
+					push @{$gaReport{RPRT_HIGH}}, $aAPinfo;
+					++$iKnown;
+
+					#-- unauthorized AP broadcasts protected SSID
+				} elsif( isKeyVal( \%gaSSID, $sSSID, 1 ) && 
+						 ! isKeyVal( \%gaAuthorized, $sBSS, $sSSID) ) {
+					dlog( "not ok - unauthorized $sBSS -> protected $sSSID", 1, __LINE__ );
+					$$aAPinfo{'title'} = "Unauthorized AP ($sBSS) broadcasts protected SSID ($sSSID)";
+					push @{$gaReport{RPRT_HIGH}}, $aAPinfo;
 					++$iNew;
-				}#if + else
-			}#if
+
+					#-- unauthorized/unknown AP broadcasts unknown SSID
+				} elsif( ! defined $gaSSID{$sSSID} &&
+						 ! defined $gaKnown{$sBSS} && 
+						 ! defined $gaAuthorized{$sBSS} ) {
+					dlog( "not ok - unauthorized $sBSS -> unknown $sSSID", 2, __LINE__ );
+					$$aAPinfo{'title'} = "Unauthorized AP ($sBSS) broadcasts unknown SSID ($sSSID)";
+					push @{$gaReport{RPRT_MED}}, $aAPinfo;
+					++$iNew;
+
+					#-- undefined case
+				} else {
+					#-- unauthorized AP
+					dlog( "not ok - combination is not defined $sBSS -> $sSSID", 1, __LINE__ );
+					$$aAPinfo{'title'} = "Combination is not defined $sBSS -> $sSSID";
+					push @{$gaReport{RPRT_MED}}, $aAPinfo;
+					++$iNew;
+				}#if + elsif + else 2
+			}#if close prev BSS block
 
 			#-- start new BSS
-			$sBSS = $sTmp; $isBSS = 1; $sSSID =''; $sDetails=''; $sLastSeen='';
+			$sBSS = $sTmp; $isBSS = 1; $sSSID ='';
+			$aAPinfo = {};  $$aAPinfo{'BSS'} = $sBSS; 
 
 		} elsif ( $sLine =~ /^\s+SSID: (.*)$/i && $isBSS ){
-			$sSSID = $1;
+			$sSSID = $1; $$aAPinfo{'SSID'} = $sSSID;
 		} elsif ( $sLine =~ /^\s+last seen:\s+(.*)$/i && $isBSS ){
-			$sLastSeen = $1;
-		}#if+elsif
+			$$aAPinfo{'LastSeen'}  = $1;
+		} elsif ( $sLine =~ /^\s+freq:\s+(\d+)$/i && $isBSS ){
+			$$aAPinfo{'freq'}  = $1;
+		} else {
+			++$iSkiped;
+		}#if+elsif+else 1
 
-		if( $isBSS ){
-			$sDetails .= "\n" . $sLine;
-		}#if
-		
+#		if( $isBSS ){
+#			$$aAPinfo{'info'} .= "\n" . $sLine;
+#		}#if
 
     }#while
 
-    close( $hFile )   if $hFile;    #-- close the scan dump file
     dlog("processed $iLines lines, skiped $iSkiped lines", 2, __LINE__ );
-    dlog("ok - Identified $iKnown known and $iNew new APs", 1, __LINE__ );
-	$giAPprocessed = $iKnown + $iNew;
-    dlog( Dumper( \@gaUnauthorized ), 4, __LINE__ );
+    dlog("ok - Identified $iAuth authorized, $iKnown known and $iNew new APs", 1, __LINE__ );
+	$giAPprocessed = $iAuth + $iKnown + $iNew;
+    dlog( 'gaReport: '.Dumper( \%gaReport ), 4, __LINE__ );
     dlog( "----- ok - $sub_name", 2);
-    return $iRecs;
-}#sub verifyAPs_file()
+    return 1;
+}#sub verifyAPs()
 
 
 #------------------------------------------------------------------------------
-# Read list of authorized APs into an array
+# Read a list of authorized and known BSS=SSIS arrays from a text file
 #------------------------------------------------------------------------------
 sub readAPfile($){
     my ( $sJFile) = @_;
     my $sub_name = 'readAPfile'; 
     dlog("+++++ $sub_name: from the file $sJFile", 2, __LINE__ );
-    my ($fh, $iLine, $sLine, $iBSS, $sBSS, $sSSID);
+    my ($fh, $iLine, $sLine, $iBSS, $sBSS, $sSSID, $sBlock);
     
-    #-- check that JSON file exists
+    #-- check that input file exists
 	if( ! myFtest('s',$sJFile) ){
 		derr( "File $sJFile does NOT exist" );
 	    dlog("----- not ok - $sub_name", 2, __LINE__ );
 		return -1;
 	}#if 
 
-    #-- open the JSON file for read
+    #-- open the input file for read
     open( $fh, "<:encoding(utf8)", $sJFile );
 	if( !$fh ) {
 		derr( "Could not open the $sJFile file: $!" );
 	    dlog("----- not ok - $sub_name", 2, __LINE__ );
 		return -1;
 	}#if 
-		
+
     #-- for all records
     $iLine = 0;  $iBSS = 0; #-- set counters to 0
+	$sBlock = INI_BLK_AUTH;
     while($sLine = <$fh>){
         chomp $sLine; ++$iLine;
         next if $sLine =~ /^\s*#/;        #-- skip comments
         next if $sLine =~ /^\s*$/;        #-- skip empty lines
-		if( $sLine =~ /^([0-9a-f:]+);(.*)$/i ){
-			$sBSS = $1; $sSSID = $2; ++$iBSS;
-			$gaAuthorized{$sBSS} = $sSSID if ! defined $gaAuthorized{$sBSS};
-		}#if
-        
+		
+		if(      $sLine =~ /^\s*\[(.*)\]/ ){
+			#-- change block 
+			$sBlock = lc($1); 
+			dlog( "Processing the $sBlock block", 3, __LINE__ );
+		} elsif( $sLine =~ /^([0-9a-f:]+)=(.*)$/i ){
+			$sBSS = $1; $sSSID = $2; 
+			if( $sBlock eq INI_BLK_AUTH ){
+				if ( ! defined $gaAuthorized{$sBSS}){
+					$gaAuthorized{$sBSS} = $sSSID;
+					$gaSSID{$sSSID} = 1 if ! defined $gaSSID{$sSSID};
+					dlog("Add $sBSS -> $sSSID as $sBlock", 3, __LINE__ );
+					++$iBSS;
+				#} else - repeated BSS
+				}#if; 
+			} elsif( $sBlock eq INI_BLK_KNWN ){
+				if ( ! defined $gaKnown{$sBSS}){
+					$gaKnown{$sBSS} = $sSSID;
+					$gaSSID{$sSSID} = 2 if ! defined $gaSSID{$sSSID};
+					dlog("Add $sBSS -> $sSSID as $sBlock", 3, __LINE__ );
+					++$iBSS;
+				#} else - repeated BSS
+				}#if; 
+			} else {
+				dlog( "not ok - Unknown block $sBlock: $sBSS -> $sSSID", 2, __LINE__ );
+			}#if+elsif
+		} else {
+			dlog( "not ok - Unknown line: $sLine", 2, __LINE__ );
+		}#if+elsif
     }#while
 
     close( $fh )   if $fh;    #-- close JSON file
-    dlog( Dumper( \%gaAuthorized ), 4, __LINE__ );
-    dlog(" processed $iLine records, inserted $iBSS APs", 2, __LINE__ );
+    dlog( "gaAuthorized: ".Dumper( \%gaAuthorized ), 4, __LINE__ );
+    dlog( "gaKnown: ".Dumper( \%gaKnown ), 4, __LINE__ );
+    dlog( "gaSSID: ".Dumper( \%gaSSID ), 4, __LINE__ );
+    dlog(" processed $iLine lines, inserted $iBSS APs", 2, __LINE__ );
     dlog("----- ok - $sub_name", 2, __LINE__ );
     return $iLine;
 }#sub readAPfile($)
@@ -334,6 +436,32 @@ sub dec2ip ($) {
 sub ip2dec ($) {
     unpack N => pack CCCC => split /\./ => shift;
 }#sub ip2dec
+
+
+#------------------------------------------------------------------------------
+#  Check if a key in a hash by ref $ref has specified value $val
+#  Returns: 1/true - key exists and has specified value, 0/false otherwise
+#------------------------------------------------------------------------------
+sub isKeyVal($$$) {
+    my ($ref,$key,$val) = @_;
+    if( exists $$ref{$key} ){
+        if( defined $$ref{$key} ){ 
+			my $tmp = $$ref{$key};
+			if( $tmp =~ /^\d+$/ ) {
+				#-- numeric scalar
+				return $tmp == $val;
+			} else {
+				#-- string scalar
+				return $tmp eq $val;
+			}#if+else 3
+		} else {
+			return 0;
+		} #if+else 2
+	} else {
+		return 0;
+	} #if+else 1
+    return 0;
+}#sub isKeyVal
 
 
 #------------------------------------------------------------------------------
@@ -566,7 +694,7 @@ Usage: $0 [options]
     -v | --verbose : be verbose
     -l | --log=1 : Enable logging with level 1-3. 1-few, 3-everything
     -c | --config=file.ini : specify configuration file
-    -i | --input=url : REST API url to obtain authorized APs
+    -i | --input=url : REST API url to obtain authorized/known APs
     -o | --output=url : REST API url to report unauthorized APs
     -s | --scan=file.txt : file with WiFi scan results
 EOBU
@@ -586,7 +714,15 @@ sudo pacman -S perl-uri
 
 
 =head1 Updates
-  Dec 28, 2019 - add ScanCommand, known APs
+  Dec 28, 2019 
+   - add ScanCommand, 
+   - convert to INI-style for input text with authorized/known APs, 
+   - add 3 categories: authrozed, know, unauthorized
+   - add 3 alarms with different severity: 
+	high) An unauthorized AP broadcasts the protected SSID xxx
+	medium) An unknown AP broadcasts an unknown SSID xxxx
+	low) An unknown AP broadcasts the known SSID xxxx
+   - add 2 modes: normal (reports only alarm high), strict (reports all 3 alarms)
   Dec 27, 2019 - add read authorized APs, report unauthorized
   Dec 25, 2019 - initial draft
 
