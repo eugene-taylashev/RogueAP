@@ -7,7 +7,6 @@
 #       -h          this help
 #       -l 2        enable debug with level X 0-3 (nothing-high)
 #       -v          be verbose
-#		-m normal|strict mode to report unauthorized  
 #		-i url		URL to JSON with authorized/known APs
 #       -o url      URL to report rogue APs
 #       -s file     Text file with dump of `sudo iw wlan0 scan`
@@ -56,7 +55,6 @@ my %gaAuthorized; 		#-- hash for authorized APs BSS->SSID
 my %gaKnown;			#-- hash for known APs BSS->SSID
 my %gaSSID;				#-- hash for SSID in scope SSID->1
 my %gaReport;			#-- hash with report info
-#my @gaUnAuthorized;	#-- list of hashes for unauthorized APs
 
 #-- Logging and tracking vars
 my $gisVerbose = 0;     #-- be Verbose flag. See sub dlog
@@ -99,8 +97,9 @@ my %args = ("help|h|?" => \$help,   #-- show help and exit
 };#use constant
 
 #====== Sub prototypes ======
-sub verifyAPs();
-sub readAPfile($);
+sub get_known_APs();
+sub scan_current_APs();
+sub report_results();
 sub countSecs($);
 sub myFtest($$);
 sub myFopen($$$);
@@ -149,8 +148,10 @@ dlog("ok - Log level is $giLogLevel", 1, __LINE__) if $giLogLevel > 0;
 dlog("ok - Log file is $gsLogFile", 1, __LINE__) if $giLogLevel > 0;
 dlog((myFtest('s',$gsScanFile)?'':'not ')."ok - WiFi scan results is $gsScanFile", 1, __LINE__) if defined $gsScanFile;
 
-readAPfile($gsInURL) if defined $gsInURL;
-verifyAPs();
+#-- Main steps
+get_known_APs();
+scan_current_APs();
+report_results();
 
 #-- We are done
 dlog(($giAPprocessed > 0?'':'not ')."ok - Processed $giAPprocessed APs in ".
@@ -162,12 +163,19 @@ stopDebug(); #-- close the debug file
 exit(0);
 #==================================== End of MAIN =============================
 
+#------------------------------------------------------------------------------
+# 
+#------------------------------------------------------------------------------
+sub get_known_APs(){
+	readAPfile($gsInURL) if defined $gsInURL;
+}#sub get_known_APs()
+
 
 #------------------------------------------------------------------------------
 # Process the scan results to identify authorized/known/unauthorized APs
 #------------------------------------------------------------------------------
-sub verifyAPs(){
-    my $sub_name = 'verifyAPs';  dlog("+++++ $sub_name: ", 2, __LINE__ );
+sub scan_current_APs(){
+    my $sub_name = 'scan_current_APs';  dlog("+++++ $sub_name: ", 2, __LINE__ );
     
     my $sScanRes = '';  #-- APs scan results
 
@@ -297,7 +305,7 @@ sub verifyAPs(){
     dlog( 'gaReport: '.Dumper( \%gaReport ), 4, __LINE__ );
     dlog( "----- ok - $sub_name", 2);
     return 1;
-}#sub verifyAPs()
+}#sub scan_current_APs()
 
 
 #------------------------------------------------------------------------------
@@ -372,6 +380,167 @@ sub readAPfile($){
 }#sub readAPfile($)
 
 
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+sub report_results(){
+    my $sub_name = 'report_results'; 
+    dlog("+++++ $sub_name: report file $gsOutURL", 2, __LINE__ );
+    my ($fh, $sHTML, $sTmp);
+	
+    #-- open the report file for write, overwrite if exists
+    open( $fh, ">:encoding(utf8)", $gsOutURL );
+	if( !$fh ) {
+		derr( "Could not create the $gsOutURL file: $!" );
+	    dlog("----- not ok - $sub_name", 2, __LINE__ );
+		return -1;
+	}#if 
+
+	#-- add HTML header
+    $sHTML = <<EOREP1;
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+        <title>Rogue WiFi Report - $curr_date $curr_time</title>
+  <style>
+	.rtitle { 
+		font-family: verdana,arial,serif; 
+		font-size: 12pt; 
+		font-weight: bold;
+		margin-top: 0.8em; 
+    }
+	.caption {    
+		FONT-FAMILY: Arial, Helvetica, sans-serif; 
+		FONT-SIZE: 10pt;
+		font-style: italic;
+    }
+	.caption2 {    
+		FONT-FAMILY: Arial, Helvetica, sans-serif; 
+		FONT-SIZE: 12pt;
+		font-style: italic;
+		width: 120px;
+    }
+  </style>
+  </head>
+  <body>
+	<h1>Report of WiFi Access points (APs)</h1>
+	<div><span class="caption2">Scan time: </span>
+	  <span class="param">$curr_date $curr_time</span></div>
+	<div><span class="caption2">Location: </span>
+	  <span class="param">Somewhare</span></div>
+
+EOREP1
+;
+	#-- count risks
+	my ($iHigh, $iMed, $iLow, $iInfo) = (0,0,0,0);  $sTmp = '';
+
+    #-- dump high risks
+    if ( defined $gaReport{RPRT_HIGH} ){
+		$sTmp .= '<h2 id="hrisks">High Risks</h2>';
+        my $aRisks = $gaReport{RPRT_HIGH};
+        foreach my $r (@$aRisks){
+			$sTmp .= parse_risk_hash($r);
+			++$iHigh;
+        }#foreach
+		$sHTML .= '	<hr>';
+    }#if high risks
+
+    #-- dump medium risks
+    if ( defined $gaReport{RPRT_MED} ){
+		$sTmp .= '<h2 id="mrisks">Medium Risks</h2>';
+        my $aRisks = $gaReport{RPRT_MED};
+        foreach my $r (@$aRisks){
+			$sTmp .= parse_risk_hash($r);
+			++$iMed;
+        }#foreach
+		$sHTML .= '	<hr>';
+    }#if medium risks
+
+    #-- dump low risks
+    if ( defined $gaReport{RPRT_LOW} ){
+		$sTmp .= '<h2 id="lrisks">Low Risks</h2>';
+        my $aRisks = $gaReport{RPRT_LOW};
+        foreach my $r (@$aRisks){
+			$sTmp .= parse_risk_hash($r);
+			++$iLow;
+        }#foreach
+		$sHTML .= '	<hr>';
+    }#if low risks
+
+    #-- dump other info
+    if ( defined $gaReport{RPRT_INFO} ){
+		$sTmp .= '<h2 id="other">Other Information</h2>';
+        my $aRisks = $gaReport{RPRT_INFO};
+        foreach my $r (@$aRisks){
+			$sTmp .= parse_risk_hash($r);
+			++$iInfo;
+        }#foreach
+		$sHTML .= '	<hr>';
+    }#if low risks
+
+	#-- create links for risks and count them
+	$sHTML .= '<ul>';
+	$sHTML .= '<li><a href="#hrisks">High Risks: ';
+	$sHTML .= "$iHigh</a></li>";
+	dlog( "High Risks: $iHigh", 2, __LINE__);
+	$sHTML .= '<li><a href="#mrisks">Medium Risks: ';
+	$sHTML .= "$iMed</a></li>";
+	dlog( "Medium Risks: $iMed", 2, __LINE__);
+	$sHTML .= '<li><a href="#lrisks">Low Risks: ';
+	$sHTML .= "$iLow</a></li>";
+	dlog( "Low Risks: $iLow", 2, __LINE__);
+	$sHTML .= '<li><a href="#other">Other Information: ';
+	$sHTML .= "$iInfo</a></li>";
+	dlog( "Other Information: $iInfo", 2, __LINE__);
+	$sHTML .= '</ul>';
+	
+	$sHTML .= '	<hr>'.$sTmp;
+
+	#-- add HTML footer
+	$sHTML .= <<EOREP2;
+  </body>
+</html>
+EOREP2
+;
+    print $fh $sHTML;
+	
+    close( $fh )   if $fh;    #-- close the report file
+    dlog("----- ok - $sub_name: report file: $gsOutURL", 2, __LINE__ );
+    return 1;
+}#sub report_results()
+
+
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+sub parse_risk_hash($){
+	my ($ref) = @_;
+	my $sHTML = '';
+	#-- Title
+	$sHTML .= '<div class="rtitle">'.$$ref{'title'}.'</div>';
+
+	#-- BSS
+	$sHTML .= '<div><span class="caption">BSS: </span><span class="param">';
+	$sHTML .= $$ref{'BSS'}.'</span></div>';
+
+	#-- SSID
+	$sHTML .= '<div><span class="caption">SSID: </span><span class="param">';
+	$sHTML .= $$ref{'SSID'}.'</span></div>';
+
+	#-- Frequency
+	$sHTML .= '<div><span class="caption">Frequency: </span><span class="param">';
+	$sHTML .= $$ref{'freq'}.'</span></div>';
+
+	#-- Last seen
+	$sHTML .= '<div><span class="caption">Last seen: </span><span class="param">';
+	$sHTML .= $$ref{'LastSeen'}.'</span></div>';
+	return $sHTML;
+}#sub parse_risk_hash($)
+
+
+
+#==============================================================================
+# Support Functions
+#==============================================================================
 sub trim($){my ($s)=@_; $s=~ s/^\s*//; $s=~ s/\s*$//; return $s;}#-- Trim edge spaces
 sub removeLastComma($){my($s)=@_;$s =~ s/,\s*$//; return $s;}  #-- remove trail comma symbols
 sub q2($){my $s=shift; return "'".$s."'"; }
@@ -693,15 +862,15 @@ Usage: $0 [options]
     -h | --help : this help
     -v | --verbose : be verbose
     -l | --log=1 : Enable logging with level 1-3. 1-few, 3-everything
-    -c | --config=file.ini : specify configuration file
     -i | --input=url : REST API url to obtain authorized/known APs
     -o | --output=url : REST API url to report unauthorized APs
-    -s | --scan=file.txt : file with WiFi scan results
+    -s | --scan=file.htm : file with WiFi scan results
 EOBU
     print $sTmp,"\n";
     exit(0);
+#    -c | --config=file.ini : specify configuration file
 
-}#sub
+}#sub  usage()
 
 
 =pod
@@ -712,8 +881,15 @@ sudo pacman -S perl-lwp-protocol-https
 sudo pacman -Ss perl-json
 sudo pacman -S perl-uri
 
+=head1 ToDO
 
-=head1 Updates
+  - implement iTop-based REST API for authorized/known APs
+  - add SMTP for report
+  - add config file 
+  - add iTop-based REST API for tickets with high risks
+
+=head1 Update history
+  Jan  4, 2020 - add report as HTML
   Dec 28, 2019 
    - add ScanCommand, 
    - convert to INI-style for input text with authorized/known APs, 
